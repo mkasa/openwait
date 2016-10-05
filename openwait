@@ -1,0 +1,786 @@
+#!/usr/bin/env python
+
+import os, sys, socket, lockfile, hmac, argparse, base64, hashlib, pipes
+import daemon, argparse, subprocess, traceback, yaml, re
+
+# NOTE:
+#     This script works with Python 2.7 or later (older versions may work but not tested)
+#     Need python-daemon (https://pypi.python.org/pypi/python-daemon/)
+#     pipes is used to achieve compatiblity with Python 2.x
+
+challenge_size = 16
+minimum_key_size = 16
+
+openwait_dir = os.path.join(os.environ["HOME"], ".openwait")
+pid_dir = os.path.join(openwait_dir, "varrun")
+local_tmp_dir = os.path.join(openwait_dir, "vartmp")
+log_file = os.path.join(openwait_dir, "log")
+server_config_path = os.path.join(openwait_dir, "server_config")
+# client_config_path = os.path.join(openwait_dir, "client_config") # not used yet
+
+def i(message):
+    """ show information to stderr """
+    print >>sys.stderr, "INFO:", message
+    sys.stderr.flush()
+
+def isub(message):
+    """ show information to stderr (indented) """
+    print >>sys.stderr, ("\t" + message)
+    sys.stderr.flush()
+
+def e(message):
+    """ show error message to stderr """
+    print >>sys.stderr, "ERROR:", message
+    sys.stderr.flush()
+
+# The function below is shared between lopen/openwait
+def hex_digest(key_str, content_str):
+    """ returns the hex string of the digest of content_str using key_str as a key """
+    macobj = hmac.new(key_str, content_str, hashlib.sha256)
+    return macobj.hexdigest()
+
+def get_yaml_param(config, key_str_list, py_type, default=None):
+    """
+    get a parameter from a YAML config file.
+    eg) get_yaml_param(config_dict, ['lopen', 'enabled'], bool, False)
+        it means it gets a parameter of bool from lopen/enabled,
+        and returns False (as a default value) if the key does not exist.
+        if the default value is None, it outputs an error and returns None
+        if the key does not exist.
+    """
+    cur_obj = config
+    for key in key_str_list:
+        if not key in cur_obj:
+            if default == None:
+                e("Key '/%s' does not exist" % ("/".join(key_str_list)))
+            return default
+        cur_obj = cur_obj[key]
+    if isinstance(cur_obj, py_type):
+        return cur_obj
+    e("Key '/%s' has a wrong type (expected %s but actually %s)"
+            % ("/".join(key_str_list), str(py_type), type(cur_obj)))
+    return None
+
+def check_protocol(config, url_str):
+    """ parses URL and returns (is the protocol allowed?, the string of the protocol) """
+    r = re.match(r'\A([^:]+)://', url_str)
+    if r == None:
+        return False, 'none'
+    prot_str = r.group(1)
+    if prot_str == 'http':
+        return get_yaml_param(config, ['lopen', 'allow_http_protocol'], bool), prot_str
+    elif prot_str == 'https':
+        return get_yaml_param(config, ['lopen', 'allow_https_protocol'], bool), prot_str
+    elif prot_str == 'file':
+        return get_yaml_param(config, ['lopen', 'allow_file_protocol'], bool), prot_str
+    else:
+        return get_yaml_param(config, ['lopen', 'allow_other_protocols'], bool), prot_str
+
+def command_open(config, args, params, cf, combined_key):
+    """ open a given URL at the local machine """
+    try:
+        if args.debug: i("open:")
+        (hmac_hex_digest, url_str) = params
+    except:
+        if args.debug: e("open: # param does not match")
+        return
+    if args.debug:
+        isub("HMAC: %s" % hmac_hex_digest)
+        isub("URL: %s" % url_str)
+    my_hmac_hex_digest = hex_digest(combined_key, url_str)
+    if args.debug: isub("MYHMAC: %s" % my_hmac_hex_digest)
+    if hmac_hex_digest != my_hmac_hex_digest:
+        e("open: the HMAC of the URL does not match")
+        print >>cf, "ERROR\tNOT AUTHORIZED"
+        return
+    if args.debug: i("open: MATCHED")
+    if not get_yaml_param(config, ['lopen', 'enabled'], bool):
+        try:
+            print >>cf, "ERROR\tERROR: lopen is disabled"
+            cf.flush()
+            return
+        except Exception, ex:
+            e("open: socket error"); e(ex)
+            return
+    try:
+        print >>cf, "OK"
+        cf.flush() # it does not need to do, but slightly better in performance (open below may take long)
+    except Exception, ex:
+        e("open: socket error"); e(ex)
+
+    should_filter_url = get_yaml_param(config, ['lopen', 'filter_non_url_chars'], bool)
+    if should_filter_url == None or should_filter_url:
+        new_url_str = re.sub(r'[^A-Za-z:/%\-+=0-9\.,\?#\[\]@!\$&\'\(\)*]', '', url_str)
+        if new_url_str != url_str:
+            i("some characters in the URL is filtered.")
+            isub("GIVEN: " + url_str)
+            isub("USED : " + new_url_str)
+            url_str = new_url_str
+
+    is_protocol_allowed, detected_protocol = check_protocol(config, url_str)
+    if not is_protocol_allowed:
+        try:
+            e("open: protocol '%s' is not allowed by config" % detected_protocol)
+            print >>cf, "ERROR\tERROR: the protocol '%s' is not allowed by config. See %s for details." % (detected_protocol, server_config_path)
+            cf.flush()
+            return
+        except Exception, ex:
+            e("open: socket error"); e(ex)
+            return
+
+    try:
+        os.system("open %s" % pipes.quote(url_str))
+        i("open: finished")
+    except Exception, ex:
+        e("open: system() error"); e(ex)
+
+def command_pbpaste(config, args, params, cf, combined_key, command_type_str):
+    """ output the content of the clipboard (to the client) """
+    def cferrorprint(msg):
+        try:
+            print >>cf, msg
+            cf.flush()
+        except Exception, ex:
+            e("pbpaste: could not return an error"); e(ex)
+
+    # Step 3) (see lcopy 'Protocol' in local_paste() )
+    try:
+        if args.debug: i("pbpaste:" + command_type_str)
+        their_paste_hex_digest = params[0]
+    except Exception, ex:
+        e("pbpaste: the number of parameters does not match"); e(ex)
+        cferrorprint("ERROR\tNOT AUTHORIZED")
+        return
+    if args.debug: isub("HMAC: %s" % their_paste_hex_digest)
+    my_paste_hex_digest = hex_digest(combined_key, "paste")
+    if args.debug: isub("MYHMAC: %s" % my_paste_hex_digest)
+    if their_paste_hex_digest != my_paste_hex_digest:
+        e("pbpaste: the HMAC of the URL does not match")
+        cferrorprint("ERROR\tNOT AUTHORIZED")
+        return
+    # Step 4)
+    config_main_key = 'lpaste' if command_type_str == "pbpaste" else 'limpaste'
+    if not get_yaml_param(config, [config_main_key, 'enabled'], bool):
+        e("pbpaste: lpaste is not allowed")
+        cferrorprint("ERROR\tERROR: not allowed by config. See %s (on the local machine) for details" % server_config_path)
+        return
+
+    try:
+        command_str_list = [command_type_str]
+        if command_type_str == "impbpaste": command_str_list.append('/dev/stdout')
+        pbpaste_process = subprocess.Popen(command_str_list, stdout=subprocess.PIPE)
+    except Exception, ex:
+        e("pbpaste: pbpaste could not be executed"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: pbpaste could not be executed.")
+        return
+    try:
+        clipboard_content = pbpaste_process.stdout.read()
+        if args.debug: print "read %d bytes from pbpaste" % len(clipboard_content)
+    except Exception, ex:
+        e("pbpaste: could not read from pbpaste"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: could not read from pbpaste")
+        return
+    try:
+        pbpaste_process.wait()
+        if args.debug: print "pbpaste finished"
+    except Exception, ex:
+        e("pbpaste: the process could not be waited"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: could not wait for pbpaste")
+        return
+    error_code = pbpaste_process.returncode
+    if args.debug: i("pbpaste error code (%d)" % error_code)
+    if error_code != 0:
+        e("pbpaste returned non-zero exit status (%d)" % error_code)
+        cferrorprint("ERROR\tSERVER ERROR: pbpaste returned non-zero exit status")
+        return
+    max_size = get_yaml_param(config, [config_main_key, 'max_size'], int, 16384)
+    if max_size < len(clipboard_content):
+        e("pbpaste: size too big (limit: %d, actual: %d)" % (max_size, len(clipboard_content)))
+        cferrorprint("ERROR\tSERVER ERROR: pbpaste returned non-zero exit status")
+        return
+    try:
+        print >>cf, "OK"; cf.flush() # This is a port of Step 3, though we need to defer it to here to make sure pbpaste succeeded
+        print >>cf, len(clipboard_content)
+        if args.debug: i("returned OK")
+    except Exception, ex:
+        e("pbpaste: socket was probably closed?"); e(ex)
+        # We do not send an error message to the client because we may have sent "OK" already.
+        return
+    # Step 5)
+    size_str = str(len(clipboard_content))
+    if args.debug: i("size is %d" % size_str)
+    try:
+        my_size_hex_digest = hex_digest(combined_key, size_str)
+        print >>cf, my_size_hex_digest
+    except Exception, ex:
+        e("pbpaste: failed in sending the digest of the size."); e(ex)
+        return
+    # Step 6)
+    try:
+        my_content_hex_digest = hex_digest(combined_key, clipboard_content)
+        if args.debug: isub("MAC: %s" % my_content_hex_digest)
+        print >>cf, my_content_hex_digest
+    except Exception, ex:
+        e("pbpaste: failed in sending the digest of the content."); e(ex)
+        return
+    # Step 7)
+    try:
+        if args.debug: i("Writing content")
+        cf.write(clipboard_content)
+    except Exception, ex:
+        e("pbpaste: failed in sending the the content."); e(ex)
+        return
+    if args.debug: i("Finished writing")
+
+def command_pbcopy(config, args, params, cf, combined_key, command_type_str):
+    """ copy the input (from the client) to the clipboard """
+    def cferrorprint(msg):
+        try:
+            print >>cf, msg
+            cf.flush()
+        except Exception, ex:
+            e("pbcopy: could not return an error"); e(ex)
+    # Step 3) (see lcopy 'Protocol' in local_copy() )
+    try:
+        if args.debug: i("pbcopy:" + command_type_str)
+        (size_str, their_size_hex_digest, their_content_hex_digest) = params
+    except:
+        if args.debug: e("ERROR: the number of parameters does not match")
+        cferrorprint("ERROR\t# PARAMETERS DOES NOT MATCH")
+        return
+    if args.debug: isub("HMAC(size, content): %s, %s" % (their_size_hex_digest, their_content_hex_digest))
+    try:
+        size = int(size_str)
+    except:
+        cferrorprint("ERROR\tsize is not an integer")
+        return
+    my_size_hex_digest = hex_digest(combined_key, size_str)
+    if my_size_hex_digest != their_size_hex_digest:
+        e("ERROR: pbcopy: size digest does not match")
+        isub("MINE  : %s" % my_size_hex_digest)
+        isub("THEIRS: %s" % their_size_hex_digest)
+        cferrorprint("ERROR\tsize digest does not match")
+        return
+    config_main_key = 'lcopy' if command_type_str == 'lcopy' else 'limcopy'
+    is_enabled = get_yaml_param(config, [config_main_key, 'enabled'], bool)
+    if not is_enabled:
+        e("pbcopy: not enabled")
+        cferrorprint("ERROR\tnot allowed by config. See %s (on the local machine) for details." % server_config_path)
+        return
+    if size < 0:
+        e("pbcopy: got a negative size (%d)" % size)
+        cferrorprint("ERROR\tsize is negative")
+        return
+    max_size = get_yaml_param(config, [config_main_key, 'max_size'], int)
+    if max_size < size:
+        e("pbcopy: too big size (%d (max %d))" % (size, max_size))
+        cferrorprint("ERROR\tsize limit exceeded (your size %d, limit %d)" % (size, max_size))
+        return
+    try:
+        print >>cf, "OK"
+        cf.flush()
+    except Exception, ex:
+        e("ERROR: pbcopy: could not return OK"); e(ex)
+        return
+    # Step 4)
+    if args.debug: i("receiving the content of size %d" % size)
+    if size == 0:
+        content = ''
+    else:
+        try:
+            content = cf.read(size)
+        except Exception, ex:
+            e("pbcopy: could not read a content (maybe the socket is closed?) "); e(ex)
+            return
+    if args.debug: i("got %d bytes" % len(content))
+    # 5) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    my_content_hex_digest = hex_digest(combined_key, content)
+    if args.debug: i("HMAC: %s" % my_content_hex_digest)
+    if their_content_hex_digest != my_content_hex_digest:
+        e("content digest does not match")
+        isub("MINE  : %s" % my_content_hex_digest)
+        isub("THEIRS: %s" % their_content_hex_digest)
+        cferrorprint("ERROR\tcontent digest does not match")
+        return
+    # OK. It's verified. Let's pbcopy
+    if args.debug: i("Verified")
+    try:
+        command_str_list = [command_type_str]
+        if command_type_str == 'impbcopy': command_str_list.append('-')
+        pbcopy_process = subprocess.Popen(command_str_list, stdin=subprocess.PIPE)
+    except Exception, ex:
+        e("pbcopy: could not execute pbcopy"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: could not execute pbcopy")
+        return
+    if args.debug: i("pbcopy started")
+    try:
+        pbcopy_process.stdin.write(content)
+    except Exception, ex:
+        e("pbcopy: could not write to a pipe"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: could not write to a pipe")
+        return
+    pbcopy_process.stdin.close()
+    if args.debug: i("finished writing to pbcopy")
+    try:
+        pbcopy_process.wait()
+        if args.debug: i("pbcopy finished")
+    except Exception, ex:
+        e("pbcopy: could not wait pbcopy"); e(ex)
+        cferrorprint("ERROR\tSERVER ERROR: could not wait pbcopy")
+        return
+    error_code = pbcopy_process.returncode
+    if args.debug: i("pbcopy exit code is %d" % error_code)
+    if error_code != 0:
+        e("pbpaste returned non-zero exit status (%d)" % error_code)
+        cferrorprint("ERROR\tpbpaste returned non-zero exit status")
+        return
+    try:
+        print >>cf, "OK"
+    except Exception, ex:
+        e("pbcopy could not return OK status"); e(ex)
+    if args.debug: print "sent OK"
+
+def command_push(config, args, params, cf, combined_key):
+    """ push a file (of the client) to the local directory """
+    def cferrorprint(msg):
+        try:
+            print >>cf, msg
+            cf.flush()
+        except Exception, ex:
+            e("pbcopy: could not return an error"); e(ex)
+    # 2) -> server: push shouldopen('0'/'1') dest_path_type ('-' (none) or '.' (curdir) or '/' (abspath)) dest_path (base64encoded path)
+    #                    size_str hmac(shouldopen + dest_path_type + dest_path + "/" + size_str)
+    try:
+        if args.debug: i("push:")
+        (shouldopen_str, dest_path_type, dest_path_base64_str, size_str, their_command_hex_digest) = params
+    except:
+        if args.debug: e("ERROR: the number of parameters does not match")
+        cferrorprint("ERROR\t# PARAMETERS DOES NOT MATCH")
+        return
+    # 3) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    try:
+        size = int(size_str)
+    except:
+        cferrorprint("ERROR\tsize is not an integer")
+        return
+    # check if the digests match
+    my_command_hex_digest = hex_digest(combined_key, shouldopen_str + dest_path_type + dest_path_base64_str + "/" + size_str)
+    if my_command_hex_digest != their_command_hex_digest:
+        e("ERROR: push: size digest does not match")
+        isub("MINE  : %s" % my_command_hex_digest)
+        isub("THEIRS: %s" % their_content_mac_hex_str)
+        cferrorprint("ERROR\tcommand digest does not match")
+        return
+    # check if push is allowed
+    is_enabled = get_yaml_param(config, ['lpush', 'enabled'], bool)
+    if not is_enabled:
+        e("push: not enabled")
+        cferrorprint("ERROR\tnot allowed by config. See %s (on the local machine) for details." % server_config_path)
+        return
+    # negative size check
+    if size < 0:
+        e("push: got a negative size (%d)" % size)
+        cferrorprint("ERROR\tsize is negative")
+        return
+    # check the size limit
+    max_size = get_yaml_param(config, ['lpush', 'max_size'], int)
+    if max_size < size:
+        e("push: too big size (%d (max %d))" % (size, max_size))
+        cferrorprint("ERROR\tsize limit exceeded (your size %d, limit %d)" % (size, max_size))
+        return
+    # decode the destination file name
+    try:
+        dest_file_name = base64.b64decode(dest_path_base64_str)
+    except Exception, ex:
+        e("push: could not decode base64 ('%s')" % dest_path_base64_str)
+        cferrorprint("ERROR\tcould not decode base64")
+        return
+    # determine the actual (full) path of the destination file
+    if dest_path_type == '.':
+        is_allowed = get_yaml_param(config, ['lpush', 'allow_push_to_current_dir'], bool)
+        if not is_allowed:
+            e("push: not allowed to write in curdir by config")
+            cferrorprint("ERROR\tpush to the current directory is not allowed by config. see '%s' for details" % server_config_path)
+            return
+        dest_path = os.path.join(".", os.path.basename(dest_file_name))
+    elif dest_path_type == '-':
+        is_allowed = get_yaml_param(config, ['lpush', 'allow_push_to_tmp_dir'], bool)
+        if not is_allowed:
+            e("push: not allowed to write in tmpmdir by config")
+            cferrorprint("ERROR\tpush to the tmp directory is not allowed by config. see '%s' for details" % server_config_path)
+            return
+        dest_path = os.path.join(local_tmp_dir, os.path.basename(dest_file_name))
+    else: # full path
+        is_allowed = get_yaml_param(config, ['lpush', 'allow_push_to_any_dir'], bool)
+        if not is_allowed:
+            e("push: not allowed to write in any dir by config")
+            cferrorprint("ERROR\tpush to any directory is not allowed by config. see '%s' for details" % server_config_path)
+            return
+        dest_path = dest_file_name
+    # check if overwrite may happend
+    overwrite_allowed = get_yaml_param(config, ['lpush', 'allow_overwrite'], bool)
+    if not overwrite_allowed and os.path.exists(dest_path):
+        e("push: not allowed to overwrite '%s'" % dest_path)
+        cferrorprint("ERROR\toverwrite to '%s' is not allowed by config. see '%s' for details" % (dest_path, server_config_path))
+        return
+    try:
+        print >>cf, "OK"
+        cf.flush()
+    except Exception, ex:
+        e("push: could not return OK"); e(ex)
+        return
+    # check if open is allowed
+    open_allowed = get_yaml_param(config, ['lpush', 'allow_open'], bool)
+    if not open_allowed:
+        e("push: not allowed to open")
+        cferrorprint("ERROR\topen after push is not allowed by config. see '%s' for details" % server_config_path)
+        return
+    # send OK status
+    if args.debug: print >>sys.stderr, "INFO: sent OK"
+    # 4) -> server: content
+    macobj = hmac.new(combined_key, '', hashlib.sha256)
+    received_size = 0
+    try:
+        with open(dest_path, 'w') as f:
+            if args.debug: i("push: opened '%s'" % dest_path)
+            while received_size < size:
+                chunk_str = cf.read(min(128 * 1024, size - received_size))
+                if chunk_str == '':
+                    e("push: premature end of the file content")
+                    return
+                f.write(chunk_str)
+                macobj.update(chunk_str)
+                received_size += len(chunk_str)
+    except IOError, ex:
+        e("push: I/O error"); e(ex)
+        return
+    except Exception, ex:
+        e("push: error while writing"); e(ex)
+        return
+    if args.debug: i("push: received %d bytes" % received_size)
+    # 5) -> server: hmac(content)
+    their_content_hex_digest = cf.readline().strip()
+    my_content_hex_digest = macobj.hexdigest()
+    if my_content_hex_digest != their_content_hex_digest:
+        e("content digest does not match")
+        isub("MINE  : %s" % my_content_hex_digest)
+        isub("THEIRS: %s" % their_content_hex_digest)
+        cferrorprint("ERROR\tcontent digest does not match")
+        return
+    # 5a) open before returning status
+    if shouldopen_str == "1" or shouldopen_str == "2":
+        try:
+            if shouldopen_str == "1":
+                option_str = ''
+            else:
+                option_str = ' -g'
+            os.system("open%s %s" % (option_str, pipes.quote(dest_path)))
+            i("open: finished")
+        except Exception, ex:
+            e("open: system() error"); e(ex)
+            cferrorprint("File transfer succeeded but failed in opening it")
+            return
+    # 6) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    try:
+        print >>cf, "OK"
+        cf.flush()
+    except Exception, ex:
+        e("push: could not return OK"); e(ex)
+        return
+
+def command_quit(config, args, params, cf, combined_key):
+    """ Process quit command. Returns true if quit is successfully issued. """
+    my_quit_hex_digest = hex_digest(combined_key, "quit")
+    if len(params) < 1 or params[0] != my_quit_hex_digest:
+        e("main_loop: could not exit due to user request because the hmac does not match")
+        i("MINE  : %s" % my_quit_hex_digest)
+        i("THEIRS: %s" % params[0])
+        cf.close()
+        return False
+    i("main_loop: exit due to user request")
+    print >>cf, "OK"
+    cf.close()
+    return True
+
+def main_loop(config, secret_key, listening_sock, args):
+    """ listens at a server port, invokes an appropriate function according to the command sent by client """
+    while True:
+        c, addr = listening_sock.accept()
+        if args.debug: ("a new incoming connection")
+        challenge = None
+        cf = c.makefile()
+        try:
+            with open("/dev/urandom", "r") as f:
+                challenge = f.read(challenge_size)
+                combined_key = secret_key + challenge
+        except:
+            e("main_loop: /dev/urandom could not be opened")
+            i("        something very bad may have happened to the system")
+            i("        (or you run me on Windows or other systems without /dev/urandom)")
+            sys.exit(2)
+        try:
+            print >>cf, "OK"
+            cf.write(challenge)
+            cf.flush()
+            i("main_loop: sent a challenge")
+        except Exception, ex:
+            e("main_loop: could not send a challenge"); e(ex)
+            cf.close()
+            c.close()
+            continue
+        try:
+            command_line_str = cf.readline().strip()
+            if args.debug: i("got a command '%s'" % command_line_str)
+            sys.stdout.flush()
+        except Exception, ex:
+            if args.debug: i("QUIT because of the premature line"); i(ex)
+            cf.close()
+            c.close()
+            continue
+        arguments = command_line_str.split(' ')
+        if len(arguments) < 2:
+            if len(arguments) < 1:
+                if args.debug: i("no command")
+                i("main_loop: got no command")
+            else:
+                if args.debug: i("no arg")
+                i("main_loop: got no arg (command = %s)" % arguments[0])
+            cf.close()
+            c.close()
+            continue
+        command_str = arguments[0]
+        parameters = arguments[1:]
+        try:
+            if command_str == "open":
+                command_open(config, args, parameters, cf, combined_key)
+            elif command_str == "pbpaste" or command_str == "impbpaste":
+                command_pbpaste(config, args, parameters, cf, combined_key, command_str)
+            elif command_str == "push":
+                command_push(config, args, parameters, cf, combined_key)
+            elif command_str == "pbcopy" or command_str == "impbcopy":
+                command_pbcopy(config, args, parameters, cf, combined_key, command_str)
+            elif command_str == "quit":
+                if command_quit(config, args, parameters, cf, combined_key):
+                    c.close()
+                    listening_sock.close()
+                    return
+                c.close()
+                continue
+            else:
+                e("main_loop: unknown command '%s'" % command_str)
+                cf.close()
+                c.close()
+                continue
+        except Exception, ex:
+            e("main_loop: logic error"); e(ex)
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_tb(exc_traceback, file=sys.stderr)
+            # we fall through for cleaning up the stuff
+        cf.close() # Just to be sure
+        c.close()
+
+def init_file_structre():
+    """ Create directories and initial files if they do not exist. """
+    # Create a dir structure if not there
+    if not os.path.exists(openwait_dir):
+        i("'%s' does not exist. Initializing..." % openwait_dir)
+        try:
+            os.mkdir(openwait_dir)
+        except:
+            e("could not mkdir '%s'" % openwait_dir)
+            sys.exit(2)
+        try:
+            os.mkdir(pid_dir)
+        except:
+            e("could not mkdir '%s'" % pid_dir)
+            sys.exit(2)
+        try:
+            os.mkdir(local_tmp_dir)
+        except:
+            e("could not mkdir '%s'" % local_tmp_dir)
+            sys.exit(2)
+        try:
+            with open(server_config_path, "w") as f:
+                f.write("""# This is a server config file of openwait
+lopen:
+  # lopen/enabled: if true, open from a remote host is allowed.
+  enabled: true
+  # lopen/allow_http_protocol: if true, the URL may start with 'http://'.
+  allow_http_protocol: true
+  # lopen/allow_https_protocol: if true, the URL may start with 'https://'.
+  allow_https_protocol: true
+  # lopen/allow_https_protocol: if true, the URL may start with 'file://'.
+  allow_file_protocol: false
+  # lopen/allow_https_protocol: if true, the URL may start with any other protocols than the protocols above
+  allow_other_protocols: false
+  # lopen/filter_non_url_chars: if true, characters not allowed in URLs are eliminated for security.
+  #                             you may want to disable it if you want to put non-ASCII characters directly in the URL
+  filter_non_url_chars: true
+lpaste:
+  # lpaste/enabled: if false, lpaste is not allowed.
+  enabled: false
+  # lpaste/max_size: the maximum size of data (in bytes)
+  max_size: 16384
+limpaste:
+  # limpaste/enabled: if false, limpaste is not allowed.
+  enabled: false
+  # limpaste/max_size: the maximum size of data (in bytes)
+  max_size: 10000000
+lcopy:
+  # lcopy/enabled: if false, lcopy is not allowed.
+  enabled: false
+  # lcopy/max_size: the maximum size of data (in bytes)
+  max_size: 16384
+limcopy:
+  # limcopy/enabled: if false, limcopy is not allowed.
+  enabled: false
+  # limcopy/max_size: the maximum size of data (in bytes)
+  max_size: 10000000
+lpush:
+  # lpush/enabled: if false, lpush is not allowed.
+  enabled: false
+  # lpush/allow_open: if true, the pushed file can be opened if requested.
+  allow_open: false
+  # lpush/allow_push_to_tmp_dir: if true, the destination can be an openwait tmp dir (default: ~/.openwait/vartmp)
+  allow_push_to_tmp_dir: true
+  # lpush/allow_push_to_current_dir: if true, the destination can be the current dir.
+  allow_push_to_current_dir: false
+  # lpush/allow_push_to_any_dir: if true, the destination can be any directory.
+  #     this option is dangerous, so please be careful if you enable it.
+  #     for example, it could write to ~/.ssh/authorized_keys.
+  allow_push_to_any_dir: false
+  # lpush/allow_overwrite: if false, the file cannot be overwritten.
+  allow_overwrite: false
+  # lpush/max_size: the maximum size of data (in bytes)
+  max_size: 10000000
+""")
+        except:
+            e("could not create a server config file '%s'" % server_config_path)
+            sys.exit(2)
+        # try:
+            # with open(client_config_path, "w") as f:
+                # f.write("""# This is a client config file of openwait
+# """)
+        # except:
+            # e("could not create a client config file '%s'" % client_config_path)
+            # sys.exit(2)
+
+def main(args, secret_key):
+    init_file_structre()
+
+    # Parse a config file
+    try:
+        yaml_str = open(server_config_path, "r").read().decode('utf8')
+    except Exception, ex:
+        e("could not read a config from '%s'" % server_config_path); e(ex)
+        sys.exit(2)
+    try:
+        yaml_config = yaml.load(yaml_str)
+    except Exception, ex:
+        e("could not parse YAML"); e(ex)
+        sys.exit(2)
+
+
+    # Open a log file
+    try:
+        log_file_obj = open(log_file, "a+")
+    except:
+        e("could not open a log file '%s'" % log_file)
+
+    # Create a socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except socket.error:
+        e("Could not open a socket")
+        sys.exit(2)
+
+    bind_to_any_port = 0
+    sock.bind(("localhost", bind_to_any_port))
+    queue_size = 5
+    sock.listen(queue_size)
+
+    (ip, port) = sock.getsockname()
+    if args.debug: i("Port num = %d" % port)
+    print port
+    sys.stdout.flush()
+
+    if args.foreground:
+        main_loop(yaml_config, secret_key, sock, args)
+    else:
+        daemon_context = daemon.DaemonContext(
+                working_directory = pid_dir,
+                umask = 0o002,
+                stderr = log_file_obj,
+                files_preserve = [sock],
+                pidfile = lockfile.FileLock(os.path.join(pid_dir, "openwait.pid"))
+                )
+
+        with daemon_context:
+            main_loop(yaml_config, secret_key, sock, args)
+
+def do_quit(args, secret_key):
+    """ process a quit command. it happens primarily when rssh exits.  """
+    try:
+        quit_port = int(args.quit)
+    except:
+        e("port number should be an integer ('%s')" % args.quit)
+        sys.exit(2)
+    # Create a socket
+    try:
+        sock = socket.create_connection(("localhost", quit_port))
+        sf = sock.makefile()
+    except socket.error:
+        e("Could not open a socket")
+        sys.exit(2)
+    status = sf.readline().strip()
+    if status != "OK":
+        e("Could not get a challenge")
+        eys.exit(2)
+    challenge = sf.read(challenge_size)
+    combined_key = secret_key + challenge
+    sf.write("quit %s\n" % hex_digest(combined_key, "quit"))
+    sf.flush()
+    status = sf.readline().strip()
+    if status != "OK":
+        e("Could not quit")
+    else:
+        if args.debug: i("Quit")
+    sf.close()
+    sock.close()
+
+def dump_config_and_exit():
+    print >>sys.stderr, "Dumping config ..."
+    yaml_str = open(server_config_path, "r").read().decode('utf8')
+    yaml_config = yaml.load(yaml_str)
+    print yaml_config
+    sys.exit(0)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--foreground", action="store_true", help="run on foreground")
+    parser.add_argument("--dumpconfig", action="store_true", help="dumps a config. useful for checking if the config conforms to the YAML format")
+    parser.add_argument("--quit", help="quit the daemon")
+    args = parser.parse_args()
+
+    if args.dumpconfig: dump_config_and_exit()
+
+    if 'OPENWAIT_DEBUG' in os.environ:
+        args.debug = True
+    # Check secretkey
+    if not 'OPENWAIT_KEY' in os.environ:
+        e("no secret key is avaiable.")
+        sys.exit(2)
+    try:
+        secret_key = base64.b64decode(os.environ['OPENWAIT_KEY'])
+    except:
+        e("could not decode base64 of OPENWAIT_KEY ('%s')" % os.environ['OPENWAIT_KEY'])
+        sys.exit(2)
+    if len(secret_key) < minimum_key_size:
+        e("OPENWAIT_KEY is too short (%d bytes). The size must be longer than 15 bytes." % len(secret_key))
+        sys.exit(2)
+
+    if args.quit != None:
+        do_quit(args, secret_key)
+    else:
+        main(args, secret_key)
