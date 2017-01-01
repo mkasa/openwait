@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+
+import os, sys, socket
+import subprocess, base64, hashlib
+import hmac, pipes, argparse
+
+# global variables
+debugging = False
+challenge_size = 16
+pbpaste_size_limit = 16 * 1024
+config_file_path = os.path.join(os.environ["HOME"], ".openwait/config")
+
+# The function below is shared between lopen/openwait
+def hex_digest(key_str, content_str):
+    """ returns the hex string of the digest of content_str using key_str as a key """
+    macobj = hmac.new(key_str, content_str, hashlib.sha256)
+    return macobj.hexdigest()
+
+def lopen_print_usage():
+    print >>sys.stderr, """Usage: lopen [options...] <URL>
+    """
+
+def lpaste_print_usage():
+    print >>sys.stderr, """Usage: lpaste [options...]
+    """
+
+def lcopy_print_usage():
+    print >>sys.stderr, """Usage: lcopy [options...]
+    """
+
+def local_open(combined_key, inf, url):
+    hmac_hex_str = hex_digest(combined_key, url)
+    sending_str = "open %s %s" % (hmac_hex_str, url)
+    if debugging: print "SEND: '%s'" % sending_str
+    inf.write(sending_str)
+    inf.close()
+    if debugging: print >>sys.stderr, "INFO: wrote"
+
+def local_paste(combined_key, inf):
+    # Protocol
+    # 1) server ->: challenge_str (16 bytes)   (NOTE: this one is obtained before this function. A part of combined_key is the challenge_str)
+    # 2) -> server: pbpaste hmac("paste")
+    # 3) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    # 4) server ->: size (integer in string)
+    # 5) server ->: hmac(size)
+    # 6) server ->: hmac(content)
+    # 7) server ->: content (size bytes)
+    if debugging: print >>sys.stderr, "INFO: pbpaste is found"
+
+    # Step 2)
+    sending_str = "pbpaste %s" % hex_digest(combined_key, "paste")
+    print >>inf, sending_str
+    inf.flush()
+    if debugging: print >>sys.stderr, "INFO: pbpaste command is sent"
+    # Step 3)
+    status = inf.readline().strip()
+    if status != "OK":
+        print >>sys.stderr, "ERROR (1): " + status
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: received OK"
+    # Step 4)
+    size_str = inf.readline().strip()
+    try:
+        size = int(size_str)
+    except:
+        print >>sys.stderr, "ERROR: received size is not an integer"
+        sys.exit(2)
+    if size < 0:
+        print >>sys.stderr, "ERROR: data size (%d) is negative" % size
+        sys.exit(2)
+    if pbpaste_size_limit < size:
+        print >>sys.stderr, "ERROR: data size (%d) exceeds the transfer limit (%d)" % (size, pbpaste_size_limit)
+        print >>sys.stderr, "       if you need to transfer more, edit the config file (%s)" % config_file_path
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: size limit OK (%d < %d)" % (size, pbpaste_size_limit)
+    # Step 5)
+    my_size_mac_hex_str = hex_digest(combined_key, size_str)
+    their_size_mac_hex_str = inf.readline().strip()
+    if their_size_mac_hex_str != my_size_mac_hex_str:
+        print >>sys.stderr, "ERROR: the hmac of the size does not match"
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: the size HMAC matched"
+    # Step 6)
+    their_content_mac_hex_str = inf.readline().strip()
+    # Step 7)
+    clipboard_str = inf.read(size)
+    if debugging: print >>sys.stderr, "INFO: %d bytes received" % size
+    my_content_mac_hex_str = hex_digest(combined_key, clipboard_str)
+    if their_content_mac_hex_str != my_content_mac_hex_str:
+        print >>sys.stderr, "ERROR: the hmac of the content does not match"
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: the content HMAC matched"
+    # OK. It's verified. Let's pbpaste
+    inf.close()
+    sys.stdout.write(clipboard_str)
+    if debugging: print >>sys.stderr, "INFO: pbpaste finished"
+
+def local_copy(combined_key, inf, command_str):
+    # Protocol
+    # 1) server ->: challenge_str (challenge_size bytes)   (NOTE: this one is obtained before this function. A part of combined_key is the challenge_str)
+    # 2) -> server: pbcopy size_str hmac(size_str) hmac(content)
+    # 3) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    # 4) -> server: content
+    # 5) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    if args.input_file:
+        try:
+            with open(args.input_file, 'r') as f:
+                copy_str = f.read()
+        except Exception, ex:
+            print >>sys.stderr, "ERROR: cannot open '%s'" % args.input_file
+            sys.exit(2)
+    else:
+        copy_str = sys.stdin.read()
+    if debugging: print >>sys.stderr, "INFO: %d bytes read from stdin" % len(copy_str)
+    size_str = "%d" % len(copy_str)
+    copy_hmac_hex_str = hex_digest(combined_key, size_str)
+    content_hmac_hex_str = hex_digest(combined_key, copy_str)
+    sending_str = "%s %d %s %s" % (command_str, len(copy_str), copy_hmac_hex_str, content_hmac_hex_str)
+    print >>inf, sending_str
+    inf.flush()
+    if debugging: print >>sys.stderr, "INFO: sent command."
+    status = inf.readline().strip()
+    if status != "OK":
+        print >>sys.stderr, "ERROR (1): " + status
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: got OK"
+    inf.write(copy_str)
+    inf.flush()
+    if debugging: print >>sys.stderr, "INFO: sent content"
+    status = inf.readline().strip()
+    if status != "OK":
+        print >>sys.stderr, "ERROR (2): " + status
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: got OK"
+    inf.close()
+
+def local_push(cmdline_args, combined_key, in_sock_file):
+    """ push a file to the local machine """
+    # Protocol
+    # 1) server ->: challenge_str (challenge_size bytes)
+    #               (NOTE: this one is obtained before this function. A part of combined_key is the challenge_str)
+    # 2) -> server: push shouldopen('0'/'1'/'2') dest_path_type ('-' (none) or '.' (curdir) or '/' (abspath)) dest_path (base64encoded path)
+    #                    size_str hmac(shouldopen + dest_path_type + dest_path + "/" + size_str)
+    # 3) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    # 4) -> server: content
+    # 5) -> server: hmac(content)
+    # 6) server ->: OK  (NOTE: return "ERROR\terrormessage" if error)
+    if debugging: print >>sys.stderr, "INFO: File name: '%s'" % cmdline_args.file_path
+    if not os.path.exists(cmdline_args.file_path):
+        print >>sys.stderr, "ERROR: '%s' is not found" % cmdline_args.file_path
+        sys.exit(2)
+    try:
+        file_size = os.path.getsize(cmdline_args.file_path)
+    except Exception, ex:
+        print >>sys.stderr, "ERROR: could not get a file size of '%s'. " % cmdline_args.file_path, ex
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: the file size is %d bytes" % file_size
+    if cmdline_args.open:
+        if cmdline_args.donotactivate:
+            shouldopen_str = "2"
+        else:
+            shouldopen_str = "1"
+    else:
+        shouldopen_str = "0"
+    if cmdline_args.destination:
+        destination_type = '/'
+        destination_path_str = cmdline_args.destination
+    elif cmdline_args.pushtocwd:
+        destination_type = '.'
+        destination_path_str = os.path.basename(cmdline_args.file_path)
+    else:
+        destination_type = '-'
+        destination_path_str = os.path.basename(cmdline_args.file_path)
+    destination_path_base64str = base64.b64encode(destination_path_str)
+    size_str = "%d" % file_size
+    copy_hmac_hex_str = hex_digest(combined_key, shouldopen_str + destination_type + destination_path_base64str + "/" + size_str)
+    sending_str = "push %s %s %s %s %s" % (shouldopen_str, destination_type, destination_path_base64str, size_str, copy_hmac_hex_str)
+    print >>in_sock_file, sending_str
+    in_sock_file.flush()
+    if debugging: print >>sys.stderr, "INFO: sent command."
+    status = in_sock_file.readline().strip()
+    if status != "OK":
+        print >>sys.stderr, "ERROR (1): " + status
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: got OK"
+    macobj = hmac.new(combined_key, '', hashlib.sha256)
+    try:
+        with open(cmdline_args.file_path, 'r') as f:
+            while True:
+                chunk_str = f.read(128 * 1024)
+                if chunk_str == '': break
+                in_sock_file.write(chunk_str)
+                macobj.update(chunk_str)
+    except Exception, ex:
+        print >>sys.stderr, "ERROR (2): " + status
+        sys.exit(2)
+    in_sock_file.write(macobj.hexdigest() + "\n")
+    in_sock_file.flush()
+    if debugging: print >>sys.stderr, "INFO: sent content and the hash"
+    status = in_sock_file.readline().strip()
+    if status != "OK":
+        print >>sys.stderr, "ERROR (3): " + status
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: got OK"
+    in_sock_file.close()
+
+def connect_to_host():
+    if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is found. trying to connect to a server."
+    # host = os.environ['OPENWAIT_HOST']
+    # if not 'OPENWAIT_PORT' in os.environ:
+        # print >>sys.stderr, "ERROR: OPENWAIT_PORT is not defined"
+        # sys.exit(2)
+    host = "localhost" # NOTE: we temporarily use localhost here. unless GatewayPort in sshd_config is set, we cannot directly connect to a forwarded port.
+    try:
+        port = int(os.environ['OPENWAIT_PORT'])
+    except:
+        print >>sys.stderr, "ERROR: OPENWAIT_PORT is not an integer"
+        sys.exit(2)
+    if not 'OPENWAIT_KEY' in os.environ:
+        print >>sys.stderr, "ERROR: OPENWAIT_KEY is not defined. Please provide a key (in base64). It must be long enough."
+        sys.exit(2)
+    secret_key = base64.b64decode(os.environ['OPENWAIT_KEY'].strip())
+    # Let's connect
+    timeout_sec = 30
+    try:
+        sock = socket.create_connection((host, port), timeout_sec)
+    except socket.error, e:
+        print e
+        sys.exit(2)
+    if debugging: print >>sys.stderr, "INFO: opened socket"
+    inf = sock.makefile()
+    first_stat = inf.readline().strip()
+    if first_stat != "OK":
+        print >>sys.stderr, "ERROR: " + first_stat
+        while True:
+            try:
+                data = sock.recv(1024)
+                print >>sys.stderr, data,
+            except:
+                break
+        print >>sys.stderr, ''
+        sys.exit(2)
+    challenge_str = inf.read(challenge_size)
+    return (secret_key + challenge_str, inf)
+
+def lopen_main(args):
+    if args.url == None:
+        lopen_print_usage()
+        sys.exit(0)
+
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_open(combined_key, inf, args.url)
+    else:
+        if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. using local open."
+        subprocess.check_call("open" + pipes.quote(args.url), shell=True)
+
+def lpaste_main(args):
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_paste(combined_key, inf, "pbpaste")
+    else:
+        if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. using local paste."
+        subprocess.check_call("pbpaste")
+
+def limpaste_main(args):
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_paste(combined_key, inf, "impbpaste")
+    else:
+        if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. using local paste."
+        subprocess.check_call("impbpaste")
+
+def lcopy_main(args):
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_copy(combined_key, inf, "pbcopy")
+    else:
+        if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. using local copy."
+        subprocess.check_call("pbcopy")
+
+def limcopy_main(args):
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_copy(combined_key, inf, "impbcopy")
+    else:
+        if debugging: print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. using local imcopy."
+        subprocess.check_call("impbcopy")
+
+def lpush_main(args):
+    if 'OPENWAIT_HOST' in os.environ:
+        combined_key, inf = connect_to_host()
+        local_push(args, combined_key, inf)
+    else:
+        print >>sys.stderr, "INFO: OPENWAIT_HOST is not found. cannot push."
+        sys.exit(2)
+
+if __name__ == "__main__":
+    my_full_name = sys.argv[0]
+    i = my_full_name.rfind("/")
+    if i == -1:
+        my_name = my_full_name
+    else:
+        my_name = my_full_name[i + 1:]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    # the code below looks redundant, but I left them as they are
+    # so they can have different command line options in the future.
+    if my_name == "lopen":
+        parser.add_argument("url")
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        lopen_main(args)
+    elif my_name == "lpaste":
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        lpaste_main(args)
+    elif my_name == "limpaste":
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        limpaste_main(args)
+    elif my_name == "lcopy":
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        lcopy_main(args)
+    elif my_name == "limcopy":
+        parser.add_argument('input_file', nargs='?', help="specify an input file")
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        limcopy_main(args)
+    elif my_name == "lpush":
+        parser.add_argument('-o', '--open', action="store_true", help="open the file after pushing it")
+        parser.add_argument('-p', '--pushtocwd', action="store_true", default=False, help="push to the local current working directory")
+        parser.add_argument('-d', '--destination', help="specify the local destination path")
+        parser.add_argument('-g', '--donotactivate', action="store_true", default=False, help="do not activate the window when opened. -o must be set.")
+        parser.add_argument("file_path")
+        args = parser.parse_args()
+        if args.debug: debugging = True
+        if args.pushtocwd and args.destination != None:
+            print >>sys.stderr, "ERROR: -p and -d are not compatible."
+            sys.exit(2)
+        if args.donotactivate and not args.open:
+            print >>sys.stderr, "ERROR: -g must be used with -o."
+            sys.exit(2)
+        lpush_main(args)
+    else:
+        print >>sys.stderr, "The name of the executable must be one of the followings:"
+        print >>sys.stderr, "    lopen, lpaste, lcopy, limpaste, limcopy, lpush"
