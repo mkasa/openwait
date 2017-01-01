@@ -111,6 +111,8 @@ $ rssh gatewayuser@gateway-host
 ```
 
 Make sure that openwait is installed on all of the remote/local hosts.
+openwait server is terminated when the rssh session finishes.
+If not, just kill the server process.
 
 # Security
 Connections between a remote host and a local host are encrypted by ssh.
