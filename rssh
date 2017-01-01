@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -e
+# set -x
+
+# NOTE: If LC_TELEPHONE cannot be used for this purpose,
+#       set OPENWAIT_SEND_ENV_NAME before calling rssh.
+#       For example, OPENWAIT_SEND_ENV_NAME=XMODIFIERS if you would like to use XMODIFIERS.
+if [ x$OPENWAIT_SEND_ENV_NAME == x ] ; then
+    OPENWAIT_SEND_ENV_NAME=LC_TELEPHONE
+fi
+
+if [ x$OPENWAIT_KEY == x ] ; then
+    export OPENWAIT_KEY=`dd if=/dev/random bs=1 count=64 2> /dev/null | base64`
+fi
+
+if [ x$OPENWAIT_PORT == x ] ; then
+    PORT=`openwait`
+else
+    PORT=$OPENWAIT_PORT
+fi
+
+if [ 1 -lt $PORT ] ; then
+    export $OPENWAIT_SEND_ENV_NAME=$OPENWAIT_KEY
+    ssh -t -R 0.0.0.0:$PORT:localhost:$PORT -o SendEnv=$OPENWAIT_SEND_ENV_NAME $* sh -c "\"export OPENWAIT_PORT=$PORT; export OPENWAIT_HOST=`hostname -f`; export OPENWAIT_KEY=\\\$$OPENWAIT_SEND_ENV_NAME; unset $OPENWAIT_SEND_ENV_NAME; \$SHELL -l\""
+    openwait --quit $PORT
+fi
