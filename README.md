@@ -110,15 +110,15 @@ $ rssh gatewayuser@gateway-host
 [iuser@internal-host ~]% lopen http://www.yahoo.com/
 ```
 
-Make sure that openwait is installed on all of the remote/local hosts.
+Make sure that openwait is installed on all the remote/local hosts.
 openwait server is terminated when the rssh session finishes.
 If not, just kill the server process.
 
 # Security
 Connections between a remote host and a local host are encrypted by ssh.
 Any processes that connect to a local daemon needs a shared secret to do
-anything serious. Any user who has a local root can steal the shared
-secret. Any user who has a remote root (or your account itself) can
+anything serious. A user who has a local root can steal the shared
+secret. Users who have a remote root (or your account itself) can
 steal the shared secret.
 
 For safety, you can allow only limited operations; you can disable
