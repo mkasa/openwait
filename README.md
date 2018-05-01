@@ -81,7 +81,7 @@ $ pip isntall python-daemon
 $ pip isntall lockfile
 ```
 
-openwait comes with waf installer, so configure&make&make install.
+openwait comes with waf installer, so `configure && make && make install`.
 (actually, make does nothing here).
 
 ```bash

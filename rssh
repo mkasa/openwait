@@ -20,8 +20,17 @@ else
     PORT=$OPENWAIT_PORT
 fi
 
+exit_function () {
+    echo "Caught SIGINT. Terminating openwait server..."
+    openwait --quit $PORT
+    exit
+}
+
 if [ 1 -lt $PORT ] ; then
+    trap "exit_function" INT
+
     export $OPENWAIT_SEND_ENV_NAME=$OPENWAIT_KEY
     ssh -t -R 0.0.0.0:$PORT:localhost:$PORT -o SendEnv=$OPENWAIT_SEND_ENV_NAME $* sh -c "\"export OPENWAIT_PORT=$PORT; export OPENWAIT_HOST=`hostname -f`; export OPENWAIT_KEY=\\\$$OPENWAIT_SEND_ENV_NAME; unset $OPENWAIT_SEND_ENV_NAME; \$SHELL -l\""
+    trap SIGINT
     openwait --quit $PORT
 fi
